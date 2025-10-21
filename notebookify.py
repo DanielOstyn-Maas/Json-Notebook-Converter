@@ -54,10 +54,12 @@ def importJson(fileName):
 def cleanupCells(cells):
     newCells = []
     for cell in cells:
-        #clear all outputs
         if cell['cell_type'] == 'code':
+            #remove fields that aren't synapse-friendly before we convert to synapse json
             cell['outputs'] = []
             cell.pop('outputs')
+            cell['id'] = []
+            cell.pop('id')
         #clear empty metadata fields to simplify diff
         if cell['metadata'] == {} and not cell['metadata'].keys():
             cell.pop('metadata')
