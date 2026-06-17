@@ -1,16 +1,16 @@
 # Json-Notebook-Converter (notebookify.py)
-A small script to convert between valid jupyter python notebooks (.ipynb) and their Azure Synapse equivalent json file. 
+A small script to convert between jupyter notebooks (.ipynb) and their Azure Synapse equivalent json file. 
+Designed to help minimize diff static between locally edited commits and commits coming from the Synapse web editor, meaning cleaner, more readable pull requests.   
 
-## Installation
-Save the script to your machine. Then you can either add its folder to your path variable or create an alias to it for easy access.
+## Installation and Aliasing
+Save the script to your machine, ideally somewhere the path won't change.
 
-## Aliasing
-### In git bash
-Add this to your `aliases.sh` file:
+### Bash or Git Bash
+Add this to your `bash.rc` file, or your `aliases.sh` file, for git bash:
 
     alias notebookify='python C:/Path/To/Script/notebookify.py'
 
-### In Powershell
+### Powershell
 Run this to open your powershell profile script:
 ```powershell
 notepad $PROFILE
@@ -25,25 +25,22 @@ function notebookify {
 Then it's just `notebookify` instead of `python notebookify.py` to use.
 ## Usage
 
-#### To convert synapse json files to valid notebooks:
+#### Synapse json to .ipynb:
 
-    python notebookify.py file1.json file2.json file3.json ...
+    notebookify file1.json file2.json file3.json ...
+This will create a `[filename]_LOCAL.ipynb` file, which you can edit in your IDE of choice.
 
-or to convert all (could be a little excessive):
+#### .ipynb notebooks to synapse json:
 
-    python notebookify.py *.json
-
-
-#### To convert all _LOCAL.ipynb notebooks in the working dir back to synapse json:
-
-    python notebookify.py -j
+    notebookify -j
+ This will convert all `_LOCAL.ipynb` files in the current directory back to `[filename].json`, ready to git add, commit, and push.
  
 ## Git Ignore
-When converting to ipynb, the script saves the notebook as `[filename]_LOCAL.ipynb`, which you can then edit as needed. The synapse-specific metadata (spark configuration and the like) will be stored as `[filename]_METADATA.json`. 
+When converting to ipynb, the script saves synapse-specific metadata (spark configuration and the like) as `[filename]_METADATA.json`. 
 If you wish you can include the following lines in your `.gitignore` to easily keep these out of the repo:
 
     *_LOCAL.ipynb
     *_METADATA.json
 
 ## File Creation
-This util is handy for existing files, but if you want to create a new notebook you should still create and commit it through the Synapse Analytics web editor. Synapse tracks a bunch of fields in the metadata that VSCode won't know to populate (and will actively meddle with if allowed).
+If you want to create a new notebook you should still create and commit it through the Synapse Analytics web editor. Synapse tracks a bunch of fields in the metadata that VSCode won't know to populate (and will actively meddle with if allowed).
