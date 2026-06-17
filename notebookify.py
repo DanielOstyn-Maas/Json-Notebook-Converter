@@ -54,15 +54,19 @@ def importJson(fileName):
 def cleanupCells(cells):
     newCells = []
     for cell in cells:
-        if cell['cell_type'] == 'code':
-            #remove fields that aren't synapse-friendly before we convert to synapse json
-            cell['outputs'] = []
-            cell.pop('outputs')
-            cell['id'] = []
-            cell.pop('id')
+        #remove fields that aren't synapse-friendly before we convert to synapse json
+        cell['id'] = []
+        cell.pop('id')
+        cell['outputs'] = []
+        cell.pop('outputs')
         #clear empty metadata fields to simplify diff
         if cell['metadata'] == {} and not cell['metadata'].keys():
             cell.pop('metadata')
+        #NotebookEdit (and some editors) can store a cell's source as a single string
+        #instead of a list of lines. Iterating a string yields characters, which would
+        #split the cell 1 char per line below. Normalize to a list of lines first.
+        if isinstance(cell['source'], str):
+            cell['source'] = cell['source'].splitlines(keepends=True)
         #normalize line endings
         modifiedLines = []
         for line in cell['source']:
@@ -72,10 +76,12 @@ def cleanupCells(cells):
                     #print(repr(modifiedLine))
             modifiedLines.append(modifiedLine)
         #Synapse allows the last line of a code cell to be an empty string, VSCode does not. 
+        # VSCode represents an empty code cell as having no lines, but Synapse prefers to include a single empty string line. #smh
         if cell['cell_type'] == 'code': 
             if modifiedLines == []:
                 modifiedLines.append("")
-            #We previously swapped it for a single space, so swap it back now.
+            #Synapse allows the last line of a code cell to be an empty string, VSCode does not.
+            #We previously swapped trailing empty lines for a single space, so swap it back now.
             elif (modifiedLines[-1] == " "):
                 modifiedLines[-1] = ""
         cell['source'] = modifiedLines
