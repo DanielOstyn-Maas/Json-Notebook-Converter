@@ -9,23 +9,58 @@ import os
 
 LOCAL_NOTEBOOK_FILE_ENDING = "_LOCAL.ipynb"
 JSON_METADATA_FILE_ENDING = "_METADATA.json"
+#the same markers without their extensions, so a target typed as "Name_LOCAL" still resolves
+LOCAL_NOTEBOOK_MARKER = "_LOCAL"
+JSON_METADATA_MARKER = "_METADATA"
 
-def exportMetadata(fileName, metadata):
-    fileName = Path(fileName.split('.')[0] + JSON_METADATA_FILE_ENDING)
-    print(f"Writing to {fileName}")
+
+def confirm(question, assumeYes=False):
+    #input() raises EOFError when there is no terminal attached (piped/scripted runs),
+    #so treat that as "no" rather than blowing up mid-conversion.
+    if assumeYes:
+        return True
     try:
-        with open(fileName, 'w', newline="\n") as file:
+        answer = input(question)
+    except EOFError:
+        print("\nNo interactive terminal available to answer that. Re-run with -y/--yes (or name the files explicitly) to proceed.")
+        return False
+    return answer.lower().startswith('y')
+
+
+def resolveTarget(target):
+    """Resolve a loosely typed file argument into the trio of paths it refers to.
+    'Name', 'Name.json', 'Name_LOCAL.ipynb', 'Name_METADATA.json' and any of those
+    with a directory in front all resolve to the same (json, notebook, metadata) set."""
+    path = Path(target)
+    name = path.name
+    if not name:
+        return None
+    #longest/most specific endings first: _LOCAL.ipynb must win over .ipynb
+    for ending in (LOCAL_NOTEBOOK_FILE_ENDING, JSON_METADATA_FILE_ENDING,
+                   LOCAL_NOTEBOOK_MARKER, JSON_METADATA_MARKER, ".json", ".ipynb"):
+        if name.endswith(ending) and len(name) > len(ending):
+            name = name[:-len(ending)]
+            break
+    base = str(path.with_name(name))
+    return (Path(base + ".json"),
+            Path(base + LOCAL_NOTEBOOK_FILE_ENDING),
+            Path(base + JSON_METADATA_FILE_ENDING))
+
+
+def exportMetadata(metadataPath, metadata):
+    print(f"Writing to {metadataPath}")
+    try:
+        with open(metadataPath, 'w', newline="\n") as file:
             json.dump(metadata, file, indent='\t', sort_keys=False)
     except:
         print("error writing metadata file")
 
 
-def exportNotebook(fileName, cells):
+def exportNotebook(notebookPath, cells):
     notebook = {"metadata":{}, "cells": cells}
-    fileName = Path(fileName.split('.')[0] + LOCAL_NOTEBOOK_FILE_ENDING)
-    print(f"Writing to {fileName}")
+    print(f"Writing to {notebookPath}")
     try:
-        with open(fileName, 'w', newline="\n") as file:
+        with open(notebookPath, 'w', newline="\n") as file:
             json.dump(notebook, file, indent='\t', sort_keys=False)
     except:
         print("error writing to notebook file")
@@ -75,9 +110,9 @@ def cleanupCells(cells):
             modifiedLine = modifiedLine.replace("""\n""","""\r\n""")
                     #print(repr(modifiedLine))
             modifiedLines.append(modifiedLine)
-        #Synapse allows the last line of a code cell to be an empty string, VSCode does not. 
+        #Synapse allows the last line of a code cell to be an empty string, VSCode does not.
         # VSCode represents an empty code cell as having no lines, but Synapse prefers to include a single empty string line. #smh
-        if cell['cell_type'] == 'code': 
+        if cell['cell_type'] == 'code':
             if modifiedLines == []:
                 modifiedLines.append("")
             #Synapse allows the last line of a code cell to be an empty string, VSCode does not.
@@ -117,64 +152,115 @@ def dealphabetizeJsonKeys(fileName):
         print(f"error writing to json file {fileName}")
 
 
-def jsonifyNotebooks():
-    print(f"searching for LOCAL files in {os.getcwd()}")
+def collectNamedPairs(targets):
+    """Resolve explicitly named jsonify targets. Every target must exist as a complete
+    pair; if any of them doesn't we write nothing at all, so a typo can't half-run."""
+    pairs = []
+    seen = set()
+    problems = []
+    for target in targets:
+        resolved = resolveTarget(target)
+        if resolved is None:
+            problems.append(f"'{target}' is not a file name")
+            continue
+        jsonPath, localPath, metaPath = resolved
+        if not localPath.exists():
+            problems.append(f"'{target}': no notebook file at {localPath}")
+            continue
+        if not metaPath.exists():
+            problems.append(f"'{target}': found {localPath} but no metadata file at {metaPath}")
+            continue
+        key = str(jsonPath.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((jsonPath, localPath, metaPath))
 
+    if problems:
+        print("error: could not resolve every target, so nothing was written:")
+        for problem in problems:
+            print(f"\t{problem}")
+        sys.exit(1)
+    return pairs
+
+
+def discoverPairs():
+    """Find every _LOCAL.ipynb / _METADATA.json pair in the working directory."""
+    print(f"searching for LOCAL files in {os.getcwd()}")
     allFiles = os.listdir('.')
     localFiles = [file for file in allFiles if file.endswith(LOCAL_NOTEBOOK_FILE_ENDING)]
     metaFiles = [file for file in allFiles if file.endswith(JSON_METADATA_FILE_ENDING)]
 
+    pairs = []
     for localFile in localFiles:
         origFileName = localFile[0:-len(LOCAL_NOTEBOOK_FILE_ENDING)]
         metaFile = origFileName + JSON_METADATA_FILE_ENDING
-
-        if metaFile in metaFiles:
-            notebook = importJson(localFile)
-            metaJson = importJson(metaFile)
-            name = ''
-            print(notebook.keys())
-            print(metaJson.keys())
-            if 'name' not in metaJson.keys():
-                metaJson['name'] = origFileName
-                print(f'No name field for {localFile}. Generating from filename.')
-
-            if 'properties' not in metaJson.keys():
-                print("error: no properties found on metadata object")
-                continue
-
-            metaJson['properties']['cells'] = cleanupCells(notebook['cells'])
-
-            exportJson(origFileName + ".json", metaJson)
-        else:
+        if metaFile not in metaFiles:
             print(f"missing metadata file for {origFileName}. Skipping")
             continue
+        pairs.append((Path(origFileName + ".json"), Path(localFile), Path(metaFile)))
+    return pairs
 
 
-##Program Start Point
-i = 0
-if len(sys.argv) == 1:
-    print("USAGE:\n\tpython notebookify.py [json_file_1] [json_file_2] ... ")
-    print("Or to convert notebooks to json:\n\tpython notebookify.py -j")
-    print("\tThis will combine each file named *_LOCAL.ipynb with its _METADATA.json file")
-elif (len(sys.argv) > 1 and sys.argv[1].startswith('-j')):
-    jsonifyNotebooks()
-    sys.exit()
+def jsonifyNotebook(jsonPath, localPath, metaPath):
+    notebook = importJson(localPath)
+    metaJson = importJson(metaPath)
 
-workingDirFiles = os.listdir('.')
-for arg in sys.argv:
-    if i > 0: 
-        existingLocalNotebook = arg.split('.')[0] + LOCAL_NOTEBOOK_FILE_ENDING
-        if existingLocalNotebook in workingDirFiles:
-            print(f"Warning! This process will replace {existingLocalNotebook}.")
-            goOn = input("Do you wish to continue? (y/n):")
-            #anything but yes we skip this file.
-            if not goOn.lower().startswith('y'):
-                continue #ironically, continuing the loop means skipping the file.
+    if 'name' not in metaJson.keys():
+        metaJson['name'] = jsonPath.stem
+        print(f'No name field for {localPath}. Generating from filename.')
 
-        if arg.endswith(JSON_METADATA_FILE_ENDING):
-            print(f"METADATA file {arg} found. Skipping.")
+    if 'properties' not in metaJson.keys():
+        print(f"error: no properties found on metadata object in {metaPath}")
+        return
+
+    metaJson['properties']['cells'] = cleanupCells(notebook['cells'])
+
+    exportJson(jsonPath, metaJson)
+
+
+def jsonifyNotebooks(targets=None, assumeYes=False):
+    if targets:
+        pairs = collectNamedPairs(targets)
+    else:
+        pairs = discoverPairs()
+        #with no arguments we're rewriting whatever happens to be lying around, which is
+        #easy to do by accident when several notebooks are checked out at once.
+        if len(pairs) > 1:
+            print("These json files will be rewritten from the local notebooks in this directory:")
+            for jsonPath, _, _ in pairs:
+                print(f"\t{jsonPath}")
+            if not confirm("Rewrite all of them? (y/n):", assumeYes):
+                print("Nothing written. Name the notebooks you want (e.g. 'jsonify Aggregation') to rewrite only those.")
+                return
+
+    if not pairs:
+        print("No _LOCAL.ipynb / _METADATA.json pairs found.")
+        return
+
+    for jsonPath, localPath, metaPath in pairs:
+        jsonifyNotebook(jsonPath, localPath, metaPath)
+
+
+def notebookifyJsonFiles(targets, assumeYes=False):
+    for target in targets:
+        if Path(target).name.endswith(JSON_METADATA_FILE_ENDING):
+            print(f"METADATA file {target} found. Skipping.")
             continue
-        currentJson = importJson(arg)
+
+        resolved = resolveTarget(target)
+        if resolved is None:
+            print(f"'{target}' is not a file name. Skipping.")
+            continue
+        jsonPath, localPath, metaPath = resolved
+
+        if localPath.exists():
+            print(f"Warning! This process will replace {localPath}.")
+            #anything but yes we skip this file.
+            if not confirm("Do you wish to continue? (y/n):", assumeYes):
+                continue
+
+        currentJson = importJson(jsonPath)
 
         cells = currentJson['properties'].pop('cells')
         for cell in cells:
@@ -184,39 +270,48 @@ for arg in sys.argv:
             if "source" in cell.keys() and cell["source"] and cell["source"][-1] == "":
                 cell["source"][-1] = " "
         #cells go to the notebook object, everything else to the metadata object
-        exportMetadata(arg, currentJson)
-        exportNotebook(arg, cells)
-
-    else:
-        i += 1
+        exportMetadata(metaPath, currentJson)
+        exportNotebook(localPath, cells)
 
 
+def buildParser():
+    parser = argparse.ArgumentParser(
+        prog="notebookify.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Convert Azure Synapse notebook json into editable .ipynb notebooks and back again.",
+        epilog="""examples:
+  notebookify Aggregation.json            split into Aggregation_LOCAL.ipynb + Aggregation_METADATA.json
+  notebookify *.json                      split every notebook in the folder
+  jsonify                                 recombine every pair in the working directory (asks first if there's more than one)
+  jsonify Aggregation                     recombine just that pair; 'Aggregation.json' and
+                                          'Aggregation_LOCAL.ipynb' name the same pair
+  jsonify notebook/Aggregation DatabaseUtils
+                                          several targets at once, in any directory""")
+    parser.add_argument('-j', '-jsonify', '--jsonify', dest='jsonify', action='store_true',
+                        help="recombine _LOCAL.ipynb + _METADATA.json pairs back into synapse json")
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help="answer yes to every prompt (for non-interactive use)")
+    parser.add_argument('files', nargs='*',
+                        help="files to process. Without -j these are synapse .json notebooks. "
+                             "With -j they name the pairs to recombine, and may be given as 'Name', "
+                             "'Name.json' or 'Name_LOCAL.ipynb'. Omit to process every pair in the working directory.")
+    return parser
 
-# def get_local_ipynb_files():
-#     return [f for f in os.listdir('.') if f.endswith('_LOCAL.ipynb')]
 
-# def main():
-#     parser = argparse.ArgumentParser(description="Process JSON or _LOCAL.ipynb files.")
-#     parser.add_argument('-jsonify', action='store_true', help='Switch to processing _LOCAL.ipynb files')
-#     parser.add_argument('files', nargs='*', help='List of files to process')
+def main(argv):
+    parser = buildParser()
+    args = parser.parse_args(argv)
 
-#     args = parser.parse_args()
+    if args.jsonify:
+        jsonifyNotebooks(args.files, assumeYes=args.yes)
+        return
 
-#     if args.jsonify:
-#         if args.files:
-#             files_to_process = [f for f in args.files if f.endswith('_LOCAL.ipynb')]
-#         else:
-#             files_to_process = get_local_ipynb_files()
-#     else:
-#         files_to_process = args.files
+    if not args.files:
+        parser.print_help()
+        return
 
-#     if not files_to_process:
-#         print("No valid files provided.")
-#         sys.exit(1)
+    notebookifyJsonFiles(args.files, assumeYes=args.yes)
 
-#     print("Files to process:")
-#     for file in files_to_process:
-#         print(f" - {file}")
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main(sys.argv[1:])
