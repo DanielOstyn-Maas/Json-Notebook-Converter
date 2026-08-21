@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from json import *
 import sys
 from pathlib import Path
@@ -12,6 +13,19 @@ JSON_METADATA_FILE_ENDING = "_METADATA.json"
 #the same markers without their extensions, so a target typed as "Name_LOCAL" still resolves
 LOCAL_NOTEBOOK_MARKER = "_LOCAL"
 JSON_METADATA_MARKER = "_METADATA"
+
+#Fabric git integration stores each notebook as a 'notebook-content.py' in a
+#'<DisplayName>.Notebook' folder, next to a '.platform' file holding the display name.
+FABRIC_SOURCE_FILE_NAME = "notebook-content.py"
+FABRIC_PLATFORM_FILE_NAME = ".platform"
+FABRIC_NOTEBOOK_FOLDER_ENDING = ".Notebook"
+FABRIC_HEADER = "# Fabric notebook source"
+FABRIC_META_PREFIX = "# META "
+FABRIC_MAGIC_MARKER = "# MAGIC"
+FABRIC_MAGIC_PREFIX = "# MAGIC "
+FABRIC_COMMENT_PREFIX = "# "
+#cells are separated by banner comments like '# CELL ********************'
+FABRIC_MARKER_PATTERN = re.compile(r"^# (CELL|MARKDOWN|PARAMETERS CELL|METADATA) \*+\s*$")
 
 
 def confirm(question, assumeYes=False):
@@ -274,6 +288,244 @@ def notebookifyJsonFiles(targets, assumeYes=False):
         exportNotebook(localPath, cells)
 
 
+def resolveFabricSource(target):
+    """Resolve a fabric target to the notebook-content.py file it refers to.
+    Fabric git integration stores every notebook as 'notebook-content.py' inside a
+    '<DisplayName>.Notebook' folder, so the folder is just as natural a thing to name
+    as the file itself."""
+    path = Path(target)
+    if path.is_dir():
+        candidate = path / FABRIC_SOURCE_FILE_NAME
+        if not candidate.exists():
+            return None
+        return candidate
+    return path
+
+
+def fabricNotebookName(sourcePath):
+    """Work out what to call the notebook. Every fabric source file is named
+    'notebook-content.py', so the real name lives either in the sibling .platform
+    file or in the '<DisplayName>.Notebook' folder holding it."""
+    platformPath = sourcePath.parent / FABRIC_PLATFORM_FILE_NAME
+    if platformPath.exists():
+        try:
+            with open(platformPath, 'r', encoding="utf-8") as file:
+                platform = json.load(file)
+            displayName = platform.get('metadata', {}).get('displayName')
+            if displayName:
+                return displayName
+        except (ValueError, OSError):
+            print(f"could not read a display name out of {platformPath}. Falling back to the folder name.")
+
+    folderName = sourcePath.parent.name
+    if folderName.endswith(FABRIC_NOTEBOOK_FOLDER_ENDING):
+        return folderName[:-len(FABRIC_NOTEBOOK_FOLDER_ENDING)]
+    return sourcePath.stem
+
+
+def parseFabricMetaBlock(lines, sourceName):
+    """A fabric METADATA block is json with every line prefixed by '# META '."""
+    stripped = []
+    for line in lines:
+        if line.startswith(FABRIC_META_PREFIX):
+            stripped.append(line[len(FABRIC_META_PREFIX):])
+        elif line.rstrip() == FABRIC_META_PREFIX.rstrip():
+            stripped.append("")
+        elif line.strip():
+            #a stray line inside a metadata block would break the json, so drop it loudly
+            print(f"{sourceName}: unexpected line in a METADATA block, ignoring it: {line.strip()!r}")
+    if not stripped:
+        return {}
+    try:
+        return json.loads("\n".join(stripped))
+    except ValueError as error:
+        print(f"{sourceName}: could not parse a METADATA block ({error}). Using an empty one.")
+        return {}
+
+
+def splitFabricBlocks(lines):
+    """Chop the file into (marker, body lines) blocks. Everything before the first
+    marker is the '# Fabric notebook source' header, which carries no cell content."""
+    blocks = []
+    current = None
+    for line in lines:
+        match = FABRIC_MARKER_PATTERN.match(line)
+        if match:
+            current = (match.group(1), [])
+            blocks.append(current)
+            continue
+        if current is not None:
+            current[1].append(line)
+    return blocks
+
+
+def stripFormatPadding(lines):
+    """Fabric puts exactly one blank line after each marker and one before the next one
+    (for the last block, the file's own trailing newline stands in for the second).
+    Strip just those two - blank lines beyond them are the author's own, and dropping
+    them would put whitespace-only noise in the next diff, which is the whole thing
+    this script exists to avoid."""
+    if lines and not lines[0].strip():
+        lines = lines[1:]
+    if lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return lines
+
+
+def toSourceList(lines):
+    """nbformat wants source as a list of lines, each keeping its newline except the last."""
+    if not lines:
+        return []
+    return [line + "\n" for line in lines[:-1]] + [lines[-1]]
+
+
+def uncommentMarkdown(lines, sourceName):
+    """Fabric comments out every line of a markdown cell with '# '."""
+    uncommented = []
+    warned = False
+    for line in lines:
+        if line.startswith(FABRIC_COMMENT_PREFIX):
+            uncommented.append(line[len(FABRIC_COMMENT_PREFIX):])
+        elif line.rstrip() == "#":
+            uncommented.append("")
+        else:
+            if not warned:
+                print(f"{sourceName}: a MARKDOWN line wasn't commented out, keeping it as-is: {line.strip()!r}")
+                warned = True
+            uncommented.append(line)
+    return uncommented
+
+
+def uncommentMagic(lines):
+    """A fabric cell in a non-default language (%%sql and friends) has every line
+    prefixed with '# MAGIC '. Returns None when this isn't one of those cells."""
+    contentLines = [line for line in lines if line.strip()]
+    if not contentLines or not all(line.startswith(FABRIC_MAGIC_MARKER) for line in contentLines):
+        return None
+    uncommented = []
+    for line in lines:
+        if line.startswith(FABRIC_MAGIC_PREFIX):
+            uncommented.append(line[len(FABRIC_MAGIC_PREFIX):])
+        elif line.startswith(FABRIC_MAGIC_MARKER):
+            uncommented.append(line[len(FABRIC_MAGIC_MARKER):])
+        else:
+            uncommented.append("")
+    return uncommented
+
+
+def buildFabricCell(marker, bodyLines, sourceName):
+    lines = stripFormatPadding(bodyLines)
+
+    if marker == "MARKDOWN":
+        return {
+            'cell_type': 'markdown',
+            'metadata': {},
+            'source': toSourceList(uncommentMarkdown(lines, sourceName)),
+        }
+
+    magicLines = uncommentMagic(lines)
+    if magicLines is not None:
+        lines = magicLines
+
+    cell = {
+        'cell_type': 'code',
+        'metadata': {},
+        'source': toSourceList(lines),
+        'outputs': [],
+        'execution_count': None,
+    }
+    if marker == "PARAMETERS CELL":
+        #the tag papermill and the wider notebook ecosystem use for a parameters cell
+        cell['metadata']['tags'] = ['parameters']
+    return cell
+
+
+def fabricNotebookMetadata(fabricMeta):
+    """Keep the fabric metadata verbatim so nothing is lost, and add the kernelspec and
+    language_info that make this a complete nbformat notebook."""
+    metadata = dict(fabricMeta)
+    kernelName = fabricMeta.get('kernel_info', {}).get('name', 'synapse_pyspark')
+    metadata['kernelspec'] = {
+        'name': kernelName,
+        'display_name': kernelName,
+        'language': 'python',
+    }
+    metadata['language_info'] = {'name': 'python'}
+    return metadata
+
+
+def parseFabricNotebook(sourcePath):
+    """Turn a fabric notebook-content.py into (notebook metadata, cells)."""
+    try:
+        with open(sourcePath, 'r', encoding="utf-8") as file:
+            text = file.read()
+    except OSError as error:
+        print(f"error reading {sourcePath}: {error}")
+        return None, []
+    lines = text.replace("\r\n", "\n").split("\n")
+
+    if not lines or not lines[0].startswith(FABRIC_HEADER):
+        print(f"warning: {sourcePath} doesn't start with '{FABRIC_HEADER}'. Trying to parse it anyway.")
+
+    sourceName = str(sourcePath)
+    notebookMetadata = {}
+    cells = []
+    for marker, bodyLines in splitFabricBlocks(lines):
+        if marker == "METADATA":
+            metaBlock = parseFabricMetaBlock(bodyLines, sourceName)
+            if cells:
+                #a METADATA block sitting after a cell describes that cell
+                cells[-1]['metadata'].update(metaBlock)
+            else:
+                #the first one, before any cell, describes the notebook
+                notebookMetadata = metaBlock
+            continue
+        cells.append(buildFabricCell(marker, bodyLines, sourceName))
+
+    return fabricNotebookMetadata(notebookMetadata), cells
+
+
+def exportIpynb(notebookPath, metadata, cells):
+    #unlike the synapse path this is a standalone notebook, so it carries the nbformat
+    #version fields. nbformat_minor 4 rather than 5, since 5 wants an id on every cell.
+    notebook = {
+        'cells': cells,
+        'metadata': metadata,
+        'nbformat': 4,
+        'nbformat_minor': 4,
+    }
+    print(f"Writing to {notebookPath}")
+    try:
+        with open(notebookPath, 'w', newline="\n", encoding="utf-8") as file:
+            json.dump(notebook, file, indent='\t', sort_keys=False)
+    except OSError as error:
+        print(f"error writing to notebook file {notebookPath}: {error}")
+
+
+def notebookifyFabricFiles(targets, assumeYes=False):
+    for target in targets:
+        sourcePath = resolveFabricSource(target)
+        if sourcePath is None:
+            print(f"'{target}' is a folder with no {FABRIC_SOURCE_FILE_NAME} in it. Skipping.")
+            continue
+        if not sourcePath.exists():
+            print(f"File '{sourcePath}' not found. Skipping.")
+            continue
+
+        notebookPath = sourcePath.parent / (fabricNotebookName(sourcePath) + LOCAL_NOTEBOOK_FILE_ENDING)
+        if notebookPath.exists():
+            print(f"Warning! This process will replace {notebookPath}.")
+            #anything but yes we skip this file.
+            if not confirm("Do you wish to continue? (y/n):", assumeYes):
+                continue
+
+        metadata, cells = parseFabricNotebook(sourcePath)
+        if not cells:
+            print(f"No cells found in {sourcePath}. Is it a fabric notebook source file?")
+            continue
+        exportIpynb(notebookPath, metadata, cells)
+
+
 def buildParser():
     parser = argparse.ArgumentParser(
         prog="notebookify.py",
@@ -286,15 +538,23 @@ def buildParser():
   jsonify Aggregation                     recombine just that pair; 'Aggregation.json' and
                                           'Aggregation_LOCAL.ipynb' name the same pair
   jsonify notebook/Aggregation DatabaseUtils
-                                          several targets at once, in any directory""")
+                                          several targets at once, in any directory
+  notebookify -f notebook-content.py      convert a fabric notebook source file into a
+                                          standalone .ipynb, named from its .platform file
+  notebookify -f DimClusterLoad.Notebook  naming the fabric notebook folder works too""")
     parser.add_argument('-j', '-jsonify', '--jsonify', dest='jsonify', action='store_true',
                         help="recombine _LOCAL.ipynb + _METADATA.json pairs back into synapse json")
+    parser.add_argument('-f', '-fabric', '--fabric', dest='fabric', action='store_true',
+                        help="treat the files as fabric notebook source (notebook-content.py) "
+                             "and convert them into standalone .ipynb notebooks")
     parser.add_argument('-y', '--yes', action='store_true',
                         help="answer yes to every prompt (for non-interactive use)")
     parser.add_argument('files', nargs='*',
-                        help="files to process. Without -j these are synapse .json notebooks. "
+                        help="files to process. Without -j or -f these are synapse .json notebooks. "
                              "With -j they name the pairs to recombine, and may be given as 'Name', "
-                             "'Name.json' or 'Name_LOCAL.ipynb'. Omit to process every pair in the working directory.")
+                             "'Name.json' or 'Name_LOCAL.ipynb'. Omit to process every pair in the working directory. "
+                             "With -f they are fabric notebook-content.py files, or the "
+                             "'<Name>.Notebook' folders holding them.")
     return parser
 
 
@@ -302,12 +562,19 @@ def main(argv):
     parser = buildParser()
     args = parser.parse_args(argv)
 
+    if args.jsonify and args.fabric:
+        parser.error("-j and -f convert in opposite directions, so they can't be combined.")
+
     if args.jsonify:
         jsonifyNotebooks(args.files, assumeYes=args.yes)
         return
 
     if not args.files:
         parser.print_help()
+        return
+
+    if args.fabric:
+        notebookifyFabricFiles(args.files, assumeYes=args.yes)
         return
 
     notebookifyJsonFiles(args.files, assumeYes=args.yes)

@@ -61,6 +61,29 @@ The name can be given in whatever form is handy - `Aggregation`, `Aggregation.js
 If a named notebook has no matching `_METADATA.json` the script says so and writes nothing at all,
 rather than half-processing the list.
  
+#### Fabric notebook source to .ipynb:
+
+    notebookify -f notebook-content.py
+
+Microsoft Fabric's git integration stores each notebook as a `notebook-content.py` inside a
+`[DisplayName].Notebook` folder, with the cells separated by `# CELL ********************` banner
+comments. `-f` turns one of those files into a standalone, fully valid `.ipynb`.
+
+Since every one of those files is named `notebook-content.py`, the output is named from the
+`displayName` in the sibling `.platform` file (falling back to the folder name), so the example
+above writes `[DisplayName]_LOCAL.ipynb` next to the source. You can also just name the folder:
+
+    notebookify -f DimClusterLoad.Notebook
+
+Markdown cells are un-commented, `%%sql` and other magic cells have their `# MAGIC ` prefixes
+stripped, parameters cells keep a `parameters` tag, and the Fabric metadata (lakehouse
+dependencies, per-cell language) is preserved in the notebook's own `metadata` fields. Unlike the
+synapse path there's no `_METADATA.json` sidecar - the `.ipynb` holds everything.
+
+Note this direction is one-way for now: there's no converter back from `.ipynb` to
+`notebook-content.py`, so treat the result as read-only-ish, for reading and diffing rather than
+as the file you edit and commit.
+
 ## Git Ignore
 When converting to ipynb, the script saves synapse-specific metadata (spark configuration and the like) as `[filename]_METADATA.json`. 
 If you wish you can include the following lines in your `.gitignore` to easily keep these out of the repo:
